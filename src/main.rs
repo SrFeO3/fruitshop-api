@@ -3,6 +3,9 @@
 //! This file contains the main logic for the Fruit Shop Single Page Application (SPA) backend.
 //! It provides a RESTful API for managing fruits.
 //!
+//! ## Authentication
+//! The backend uses JWTs signed with Ed25519 keys (EdDSA) for secure authentication.
+//!
 //! ## Dependencies
 //! This backend relies on a PostgreSQL database for data storage.
 //! The connection details are configured via environment variables.
@@ -72,7 +75,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{sync::RwLock, time::Duration};
 use tokio_postgres::NoTls;
 use tower_http::cors::{Any, CorsLayer};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 /// A custom error type to handle various error kinds in the application.
@@ -155,9 +158,8 @@ struct Jwks {
 struct JwkKey {
     kty: String,
     kid: String,
-    n: String,
-    e: String,
-    alg: String,
+    x: String,
+    crv: String,
     #[serde(rename = "use")]
     key_use: String,
 }
@@ -212,8 +214,8 @@ impl JwksClient {
 
         for key in jwks.keys {
             info!("JWKS Client: Processing key details: {:?}", key);
-            if key.kty == "RSA" && key.key_use == "sig" {
-                let decoding_key = DecodingKey::from_rsa_components(&key.n, &key.e)?;
+            if key.kty == "OKP" && key.key_use == "sig" && key.crv == "Ed25519" {
+                let decoding_key = DecodingKey::from_ed_components(&key.x)?;
                 key_map.insert(key.kid.clone(), decoding_key);
             }
         }
@@ -227,6 +229,10 @@ impl JwksClient {
             );
             Ok(key.clone())
         } else {
+            warn!(
+                "JWKS Client: Key with kid '{}' not found in JWKS from {}.",
+                kid, self.jwks_uri
+            );
             Err(AppError::Auth(format!("Unknown key ID '{}'", kid)))
         }
     }
@@ -285,7 +291,7 @@ async fn auth_middleware(
             AppError::Auth("Missing or invalid Bearer token".to_string())
         })?;
 
-    info!("Auth middleware: Received token: {}", token);
+    debug!("Auth middleware: Received token: {}", token);
 
     // Test bypass: Allow a specific dummy token to skip validation
     if token == "dummy_token" {
@@ -298,7 +304,7 @@ async fn auth_middleware(
         match general_purpose::URL_SAFE_NO_PAD.decode(payload_b64) {
             Ok(decoded_payload_bytes) => {
                 if let Ok(payload_str) = String::from_utf8(decoded_payload_bytes) {
-                    info!(
+                    debug!(
                         "Auth middleware: Decoded payload (for inspection): {}",
                         payload_str
                     );
@@ -353,8 +359,8 @@ async fn auth_middleware(
     let _token_data = match decode::<Claims>(token, &decoding_key, &state.jwt_validation) {
         Ok(data) => {
             info!(
-                "Auth middleware: Token validated successfully with claims: {:?}",
-                data.claims
+                "Auth middleware: Token validated successfully for sub '{}'",
+                data.claims.sub
             );
             data
         }
@@ -397,6 +403,7 @@ async fn root_handler() -> &'static str {
 
 /// Handler for the protected /api/fruits endpoint.
 async fn get_fruits_handler(State(state): State<AppState>) -> Result<Json<Vec<Fruit>>, AppError> {
+    info!("Handling request to get all fruits");
     let client = state.db_pool.get().await?;
     let rows = client
         .query("SELECT id, name, origin, price FROM fruit ORDER BY id", &[])
@@ -421,7 +428,7 @@ async fn get_fruit_by_id_handler(
     State(state): State<AppState>,
     Path(fruit_id): Path<String>,
 ) -> Result<Json<Fruit>, AppError> {
-    info!("Fetching fruit with id: {}", fruit_id);
+    info!("Handling request to get fruit with id: {}", fruit_id);
     let client = state.db_pool.get().await?;
     let row_opt = client
         .query_opt(
@@ -455,7 +462,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
 
     // Setup tracing subscriber for logging.
-    let rust_log = std::env::var("RUST_LOG").unwrap_or_else(|_| "info,tower_http=debug".into());
+    let rust_log = std::env::var("RUST_LOG").unwrap_or_else(|_| "info,tower_http=info".into());
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(&rust_log))
         .with(tracing_subscriber::fmt::layer())
@@ -503,7 +510,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|s| s.trim().to_string())
         .collect();
 
-    let mut validation = Validation::new(jsonwebtoken::Algorithm::RS256);
+    let mut validation = Validation::new(jsonwebtoken::Algorithm::EdDSA);
     validation.set_issuer(&external_issuers);
     validation.set_audience(&["fruit-shop"]);
     info!(

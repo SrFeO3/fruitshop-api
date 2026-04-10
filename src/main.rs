@@ -1,84 +1,54 @@
 //! # Fruit Shop Backend API Server
 //!
-//! This file contains the main logic for the Fruit Shop Single Page Application (SPA) backend.
-//! It provides a RESTful API for managing fruits.
+//! A lightweight utility for development and testing, compatible with apiserver.py.
 //!
-//! ## Authentication
-//! The backend uses JWTs signed with Ed25519 keys (EdDSA) for secure authentication.
+//! [API Endpoints]
+//!   GET */api/add/<x>/<y> (No DB required)
+//!   - Returns: {"result": x+y, "comment": "...", "user": "..."}
 //!
-//! ## Dependencies
-//! This backend relies on a PostgreSQL database for data storage.
-//! The connection details are configured via environment variables.
+//!   GET */api/fruits (DB required)
+//!   - Returns: {"fruits": [{id, name, ...}, ...]}
 //!
-//! ## Run
-//! ```sh
-//! DATABASE_URL="postgres://shopuser:mysecretpassword534@127.0.0.1:5432/fruitdb" \
-//! OIDC_ISSUER_URL_INTERNAL="http://authserver:8082" \
-//! OIDC_ISSUER_URL_EXTERNAL="http://localhost:8082" \
-//! CORS_ALLOWED_ORIGINS="http://localhost:8080" \
-//! SERVER_ADDRESS="0.0.0.0:8000" \
-//! RUST_LOG="info" \
-//! cargo run
-//! ```
+//!   GET */api/fruits/<id> (DB required)
+//!   - Returns: {id, name, ...}
 //!
-//! ## Testing with Dummy Token
-//! For development and testing purposes, you can bypass JWT authentication by using a hardcoded "dummy_token".
+//! [Environment Variables]
+//!   - API_HOST: Bind address (default: 0.0.0.0)
+//!   - API_PORTS: Comma/space separated list of ports (default: 7444)
+//!   - DATABASE_URL: PostgreSQL connection string (or use DB_HOST, DB_PORT, etc.)
+//!   - OIDC_ISSUER_URL_INTERNAL: Discovery URL for JWKS.
+//!   - OIDC_ISSUER_URL_EXTERNAL: Allowed 'iss' claims in tokens.
+//!   - CORS_ALLOWED_ORIGINS: Permitted origins for CORS.
 //!
-//! ```sh
-//! curl -H "Authorization: Bearer dummy_token" http://localhost:8000/api/fruits
-//! ```
+//! [Token Processing]
+//!   - Requires Bearer token in Authorization header.
+//!   - JWS (Signed): Validates RS256 or EdDSA signatures using JWKS from OIDC Discovery.
+//!   - JWE (Encrypted): Detected but returns 401 (Not configured).
+//!   - Opaque: Tokens not in JWT format are treated as valid for testing.
 //!
-//! ## Configuration (Environment Variables)
-//! The application is configured using the following environment variables.
-//!
-//! - `SERVER_ADDRESS`:
-//!   - **Meaning**: The address to bind the server to.
-//!   - **Purpose**: Specifies the IP and port for the backend to listen on.
-//!   - **Example**: `0.0.0.0:5000`
-//!
-//! - `DATABASE_URL`:
-//!   - **Meaning**: The connection string for the PostgreSQL database.
-//!   - **Purpose**: Used to connect to the database for all data operations.
-//!   - **Example**: `postgres://user:password@db:5432/fruitdb`
-//!
-//! - `OIDC_ISSUER_URL_INTERNAL`:
-//!   - **Meaning**: The internal network address of the OIDC authentication server.
-//!   - **Purpose**: Used by this backend service to fetch the JWKS (JSON Web Key Set) for token validation. This URL should be accessible from within the Docker network.
-//!   - **Example**: `http://authserver:8082`
-//!
-//! - `OIDC_ISSUER_URL_EXTERNAL`:
-//!   - **Meaning**: The public-facing, external address of the OIDC authentication server.
-//!   - **Purpose**: Used to validate the `iss` (issuer) claim in the JWT. This URL must match the issuer URL that clients (like the frontend) use and that is embedded in the tokens.
-//!   - **Example**: `http://localhost:8082`
-//!   - **Note**: Can be a comma-separated list to support multiple hostnames (e.g., `http://localhost:8082,http://192.168.10.130:8082`).
-//!
-//! - `CORS_ALLOWED_ORIGINS`:
-//!   - **Meaning**: A comma-separated list of allowed origins for Cross-Origin Resource Sharing (CORS).
-//!   - **Purpose**: Specifies which frontend URLs are permitted to make requests to this backend API.
-//!   - **Example**: `http://localhost:8080,http://192.168.10.130:8080`
-//!
+//! [Features]
+//!   - Flexible Path Configuration: Handles arbitrary path prefixes (wildcard *).
+//!   - Resilient DB Connection: Starts in DB-less mode if connection fails and retries on demand.
 
 use std::{collections::HashMap, sync::Arc};
 
 use axum::{
     Router,
     extract::{Path, Request, State},
-    http::{self, StatusCode, header},
+    http::{self, StatusCode, Uri, header},
     middleware::{self, Next},
     response::{IntoResponse, Json, Response},
     routing::get,
 };
-use base64::{Engine as _, engine::general_purpose};
 use deadpool_postgres::{Config, Pool, Runtime};
-use jsonwebtoken::{DecodingKey, Validation, dangerous::insecure_decode, decode, decode_header};
+use jsonwebtoken::{DecodingKey, Validation, decode, decode_header};
 use serde::{Deserialize, Serialize};
 use tokio::{sync::RwLock, time::Duration};
 use tokio_postgres::NoTls;
 use tower_http::cors::{Any, CorsLayer};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-/// A custom error type to handle various error kinds in the application.
 #[derive(Debug, thiserror::Error)]
 enum AppError {
     #[error("Database pool error: {0}")]
@@ -93,9 +63,12 @@ enum AppError {
     Reqwest(#[from] reqwest::Error),
     #[error("Authentication failed: {0}")]
     Auth(String),
+    #[error("Database not configured or connection failed")]
+    DbDisabled,
+    #[error("OIDC Discovery failed: {0}")]
+    Discovery(String),
 }
 
-/// Converts our custom AppError into an HTTP response.
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, message) = match &self {
@@ -105,6 +78,9 @@ impl IntoResponse for AppError {
                 StatusCode::UNAUTHORIZED,
                 format!("JWT Error: {:?}", err.kind()),
             ),
+            AppError::DbDisabled | AppError::Discovery(_) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
+            }
             AppError::Pool(_) | AppError::Postgres(_) | AppError::Reqwest(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Internal server error".to_string(),
@@ -118,7 +94,6 @@ impl IntoResponse for AppError {
     }
 }
 
-/// Represents a fruit record from the database.
 #[derive(Serialize)]
 struct Fruit {
     id: String,
@@ -133,9 +108,13 @@ struct Fruit {
     origin_longitude: Option<f64>,
 }
 
-/// Represents the claims we expect in the JWT.
+#[derive(Serialize)]
+struct FruitsResponse {
+    fruits: Vec<Fruit>,
+}
+
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)] // Fields are used by the `jsonwebtoken` library for validation
+#[allow(dead_code)]
 struct Claims {
     iss: String,
     aud: String,
@@ -147,28 +126,39 @@ struct Claims {
     client_id: Option<String>,
 }
 
-/// Represents the structure of the JWKS response from the auth server.
 #[derive(Debug, Deserialize)]
 struct Jwks {
     keys: Vec<JwkKey>,
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)] // Some fields are part of the JWK standard but not used in our logic
+#[allow(dead_code)]
 struct JwkKey {
     kty: String,
     kid: String,
-    x: String,
-    crv: String,
+    x: Option<String>,
+    crv: Option<String>,
+    n: Option<String>,
+    e: Option<String>,
     #[serde(rename = "use")]
     key_use: String,
 }
 
-/// A client to fetch and cache JWKS keys.
 struct JwksClient {
     jwks_uri: String,
     keys: RwLock<HashMap<String, DecodingKey>>,
     http_client: reqwest::Client,
+}
+
+/// Extracts claims without signature verification for logging purposes.
+fn decode_claims_unverified(token: &str) -> Option<Claims> {
+    use base64::prelude::*;
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let decoded = BASE64_URL_SAFE_NO_PAD.decode(parts[1]).ok()?;
+    serde_json::from_slice(&decoded).ok()
 }
 
 impl JwksClient {
@@ -180,231 +170,198 @@ impl JwksClient {
         }
     }
 
-    /// Gets a decoding key by its ID (kid). Fetches and caches if not present.
     async fn get_decoding_key(&self, kid: &str) -> Result<DecodingKey, AppError> {
-        // First, check if the key is already in our cache.
         if let Some(key) = self.keys.read().await.get(kid) {
-            info!(
-                "JWKS Client: Found key with kid '{}' in cache (from {}).",
-                kid, self.jwks_uri
-            );
-            return Ok(key.clone()); // Return the cached key.
+            info!("JWKS Client: Found key with kid '{}' in cache.", kid);
+            return Ok(key.clone());
         }
 
-        // If not in cache, fetch the entire JWKS from the auth server.
         info!(
-            "JWKS Client: Key with kid '{}' not in cache. Fetching JWKS from URL: {}",
-            kid, self.jwks_uri
+            "JWKS Client: Key with kid '{}' not in cache. Fetching...",
+            kid
         );
-        let jwks: Jwks = self
+        let resp_text = self
             .http_client
             .get(&self.jwks_uri)
             .send()
             .await?
-            .json()
+            .text()
             .await?;
-        info!(
-            "JWKS Client: Successfully fetched {} keys.",
-            jwks.keys.len()
-        );
 
-        // Write the fetched keys to the cache.
+        let jwks: Jwks =
+            serde_json::from_str(&resp_text).map_err(|e| AppError::Discovery(e.to_string()))?;
+
         let mut key_map = self.keys.write().await;
+
+        // Double-check if another thread updated the cache while waiting for the lock
+        if let Some(key) = key_map.get(kid) {
+            return Ok(key.clone());
+        }
+
         key_map.clear();
 
         for key in jwks.keys {
-            info!("JWKS Client: Processing key details: {:?}", key);
-            if key.kty == "OKP" && key.key_use == "sig" && key.crv == "Ed25519" {
-                let decoding_key = DecodingKey::from_ed_components(&key.x)?;
-                key_map.insert(key.kid.clone(), decoding_key);
+            if key.key_use == "sig" {
+                if key.kty == "OKP" && key.crv.as_deref() == Some("Ed25519") {
+                    if let Some(x) = &key.x {
+                        key_map.insert(key.kid.clone(), DecodingKey::from_ed_components(x)?);
+                    }
+                } else if key.kty == "RSA" {
+                    if let (Some(n), Some(e)) = (&key.n, &key.e) {
+                        key_map.insert(key.kid.clone(), DecodingKey::from_rsa_components(n, e)?);
+                    }
+                }
             }
         }
-        info!("JWKS Client: Cache updated with new keys.");
 
-        // Try to get the key from the now-populated cache.
         if let Some(key) = key_map.get(kid) {
-            info!(
-                "JWKS Client: Successfully retrieved new key with kid '{}' from {}.",
-                kid, self.jwks_uri
-            );
             Ok(key.clone())
         } else {
-            warn!(
-                "JWKS Client: Key with kid '{}' not found in JWKS from {}.",
-                kid, self.jwks_uri
-            );
             Err(AppError::Auth(format!("Unknown key ID '{}'", kid)))
         }
     }
 }
 
-/// The shared application state.
 #[derive(Clone)]
 struct AppState {
-    db_pool: Pool,
+    db_url: Option<String>,
+    db_pool: Arc<RwLock<Option<Pool>>>,
     jwks_client: Arc<JwksClient>,
     jwt_validation: Arc<Validation>,
 }
 
-/// Axum middleware for JWT authentication.
-///
-/// This middleware intercepts requests to protected routes and performs two main tasks:
-/// handling CORS preflight requests and validating JWTs.
-///
-/// ### 1. CORS Preflight Handling
-/// It first checks if the request is a CORS preflight request (`OPTIONS`). If so, it immediately
-/// returns an empty `200 OK` response, bypassing all authentication logic. This allows the
-/// `CorsLayer` (applied later) to attach the necessary CORS headers and respond to the browser.
-///
-/// ### 2. JWT Validation
-/// For all other requests, it performs a full JWT validation based on OIDC specifications:
-///   2-1. **Extract Token**: Extracts the JWT from the `Authorization: Bearer <token>` header.
-///   2-2. **Fetch Validation Key**: Decodes the token's header to get the `kid` (Key ID), then uses it to fetch the corresponding public key from the JWKS client (which includes caching).
-///   2-3. **Validate Claims**: Verifies the token's signature, issuer (`iss`), audience (`aud`), and expiration time (`exp`).
-///   2-4. **Pass to Next Handler**: If the token is valid, the request is passed to the next handler. If any step fails, a `401 Unauthorized` error is returned.
+/// Returns the existing DB pool or attempts to initialize a new one if missing.
+async fn get_or_init_db_pool(state: &AppState) -> Result<Pool, AppError> {
+    if let Some(pool) = state.db_pool.read().await.as_ref() {
+        return Ok(pool.clone());
+    }
+
+    let url = state.db_url.as_ref().ok_or(AppError::DbDisabled)?;
+
+    let mut lock = state.db_pool.write().await;
+
+    // Double-check pattern
+    if let Some(pool) = lock.as_ref() {
+        return Ok(pool.clone());
+    }
+
+    info!("Database pool is missing. Attempting to initialize pool...");
+    let mut cfg = Config::new();
+    cfg.url = Some(url.clone());
+    cfg.pool = Some(deadpool_postgres::PoolConfig {
+        max_size: 10,
+        timeouts: deadpool_postgres::Timeouts {
+            wait: Some(Duration::from_secs(5)),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+
+    match cfg.create_pool(Some(Runtime::Tokio1), NoTls) {
+        Ok(pool) => {
+            *lock = Some(pool.clone());
+            info!("Database pool initialized successfully.");
+            Ok(pool)
+        }
+        Err(e) => {
+            error!("Failed to initialize database pool: {}", e);
+            Err(AppError::DbDisabled)
+        }
+    }
+}
+
+#[derive(Clone)]
+struct TokenValidationInfo(String);
+
 async fn auth_middleware(
     State(state): State<AppState>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Result<Response, AppError> {
-    // 1. CORS Preflight Handling:
-    // For OPTIONS requests, bypass authentication and return an empty OK response.
-    // The `CorsLayer` will then add the necessary CORS headers.
     if request.method() == http::Method::OPTIONS {
-        info!("Auth middleware: Handling CORS preflight request (OPTIONS)");
         return Ok(Response::builder()
             .status(StatusCode::OK)
             .body(Default::default())
             .unwrap());
     }
 
-    // 2-1. Extract JWT Token
-    info!("Auth middleware: Validating token...");
     let auth_header = request
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|h| h.to_str().ok());
     let token = auth_header
         .and_then(|h| h.strip_prefix("Bearer "))
-        .ok_or_else(|| {
-            warn!("Auth middleware: Missing or invalid Bearer token");
-            AppError::Auth("Missing or invalid Bearer token".to_string())
-        })?;
+        .ok_or_else(|| AppError::Auth("Missing or invalid Bearer token".to_string()))?;
 
-    debug!("Auth middleware: Received token: {}", token);
-
-    // Test bypass: Allow a specific dummy token to skip validation
-    if token == "dummy_token" {
-        info!("Auth middleware: Dummy token detected. Bypassing validation.");
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() == 5 {
+        return Err(AppError::Auth(
+            "Received JWE token but JWE_DECRYPTION_KEY is not configured.".to_string(),
+        ));
+    } else if parts.len() != 3 {
+        request.extensions_mut().insert(TokenValidationInfo(
+            "Key: Opaque, Validation: Skipped".to_string(),
+        ));
         return Ok(next.run(request).await);
     }
 
-    // For debugging, decode and display the payload before validation.
-    if let Some(payload_b64) = token.split('.').nth(1) {
-        match general_purpose::URL_SAFE_NO_PAD.decode(payload_b64) {
-            Ok(decoded_payload_bytes) => {
-                if let Ok(payload_str) = String::from_utf8(decoded_payload_bytes) {
-                    debug!(
-                        "Auth middleware: Decoded payload (for inspection): {}",
-                        payload_str
-                    );
-                } else {
-                    warn!("Auth middleware: Payload is not valid UTF-8");
-                }
-            }
-            Err(e) => {
-                warn!("Auth middleware: Failed to Base64 decode payload: {}", e);
-            }
-        }
+    if token == "dummy_token" {
+        request.extensions_mut().insert(TokenValidationInfo(
+            "Key: Opaque, Validation: Skipped".to_string(),
+        ));
+        return Ok(next.run(request).await);
     }
 
-    // 2-2. Fetch Validation Key (Part 1: Get Key ID from header)
     let header = decode_header(token)?;
     let kid = header
         .kid
         .ok_or_else(|| AppError::Auth("Token missing 'kid' in header".to_string()))?;
-    info!("Auth middleware: Found token with kid '{}'", kid);
-
-    // 2-2. Fetch Validation Key (Part 2: Get public key from JWKS client)
     let decoding_key = state.jwks_client.get_decoding_key(&kid).await?;
 
-    // Log token expiration details
-    if let Ok(token_data) = insecure_decode::<Claims>(token) {
-        let exp = token_data.claims.exp;
+    if let Some(claims) = decode_claims_unverified(token) {
+        let exp = claims.exp;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as usize;
-        let remaining = if exp > now {
-            (exp - now) as isize
-        } else {
-            -((now - exp) as isize)
-        };
-
-        info!(
-            "Auth middleware: Token Expiration Check: exp={}, now={}, remaining={}s",
-            exp, now, remaining
+        debug!(
+            " > Token exp={}, remaining={}",
+            exp,
+            exp as isize - now as isize
         );
     }
 
-    // 2-3. Validate Claims
-    // This single `decode` call verifies the signature, issuer, audience, and expiration time
-    // based on the `Validation` settings configured in `main`.
-    info!(
-        "Auth middleware: Validating token with expected values: issuers={:?}, audience={:?}, validate_exp={}",
-        state.jwt_validation.iss, state.jwt_validation.aud, state.jwt_validation.validate_exp
-    );
-
-    // Decode the token and handle potential validation errors for better logging.
     let _token_data = match decode::<Claims>(token, &decoding_key, &state.jwt_validation) {
-        Ok(data) => {
-            info!(
-                "Auth middleware: Token validated successfully for sub '{}'",
-                data.claims.sub
-            );
-            data
-        }
+        Ok(data) => data,
         Err(err) => {
-            // Log the kid to make debugging signature errors easier.
-            if let jsonwebtoken::errors::ErrorKind::InvalidSignature = err.kind() {
-                error!(
-                    "Auth middleware: Invalid signature for token with kid '{}'",
-                    kid
-                );
-            }
-            // If the error is an invalid issuer, log the expected vs actual values.
             if let jsonwebtoken::errors::ErrorKind::InvalidIssuer = err.kind() {
-                // To inspect claims for logging, decode the token without verifying the signature.
-                let unverified_claims = insecure_decode::<Claims>(token)
-                    .map(|data| data.claims)
-                    .ok();
-                let actual_issuer = unverified_claims
+                let actual_issuer = decode_claims_unverified(token)
                     .map(|c| c.iss)
                     .unwrap_or_else(|| "unknown".to_string());
-
                 error!(
-                    "Auth middleware: Invalid issuer. Expected one of: {:?}, but got: '{}'",
+                    " > VALIDATION FAILED: Invalid issuer. Expected: {:?}, Got: '{}'",
                     state.jwt_validation.iss, actual_issuer
                 );
             }
-            // Propagate the original error.
             return Err(err.into());
         }
     };
 
-    // 2-4. Pass to Next Handler
+    request.extensions_mut().insert(TokenValidationInfo(
+        "Key: JWT, Validation: Signature Verified".to_string(),
+    ));
     Ok(next.run(request).await)
 }
 
-/// Handler for the root endpoint.
-async fn root_handler() -> &'static str {
-    "Backend is running!"
+async fn root_handler() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "message": "Backend is running!" }))
 }
 
-/// Handler for the protected /api/fruits endpoint.
-async fn get_fruits_handler(State(state): State<AppState>) -> Result<Json<Vec<Fruit>>, AppError> {
-    info!("Handling request to get all fruits");
-    let client = state.db_pool.get().await?;
+async fn get_fruits_handler(
+    State(state): State<AppState>,
+) -> Result<Json<FruitsResponse>, AppError> {
+    let pool = get_or_init_db_pool(&state).await?;
+    let client = pool.get().await?;
     let rows = client
         .query("SELECT id, name, origin, price FROM fruit ORDER BY id", &[])
         .await?;
@@ -420,25 +377,23 @@ async fn get_fruits_handler(State(state): State<AppState>) -> Result<Json<Vec<Fr
             origin_longitude: None,
         })
         .collect();
-    Ok(Json(fruits))
+
+    Ok(Json(FruitsResponse { fruits }))
 }
 
-/// Handler for the protected /api/fruits/:id endpoint.
 async fn get_fruit_by_id_handler(
     State(state): State<AppState>,
     Path(fruit_id): Path<String>,
 ) -> Result<Json<Fruit>, AppError> {
-    info!("Handling request to get fruit with id: {}", fruit_id);
-    let client = state.db_pool.get().await?;
-    let row_opt = client
-        .query_opt(
-            "SELECT id, name, origin, price, description, origin_latitude::FLOAT8 AS origin_latitude, origin_longitude::FLOAT8 AS origin_longitude FROM fruit WHERE id = $1",
-            &[&fruit_id],
-        )
-        .await?;
+    let pool = get_or_init_db_pool(&state).await?;
+    let client = pool.get().await?;
+    let row_opt = client.query_opt(
+        "SELECT id, name, origin, price, description, origin_latitude::FLOAT8 AS origin_latitude, origin_longitude::FLOAT8 AS origin_longitude FROM fruit WHERE id = $1",
+        &[&fruit_id],
+    ).await?;
 
     if let Some(row) = row_opt {
-        let fruit = Fruit {
+        Ok(Json(Fruit {
             id: row.get("id"),
             name: row.get("name"),
             origin: row.get("origin"),
@@ -446,8 +401,7 @@ async fn get_fruit_by_id_handler(
             description: row.get("description"),
             origin_latitude: row.get("origin_latitude"),
             origin_longitude: row.get("origin_longitude"),
-        };
-        Ok(Json(fruit))
+        }))
     } else {
         Err(AppError::NotFound(format!(
             "Fruit with id '{}' not found",
@@ -456,76 +410,159 @@ async fn get_fruit_by_id_handler(
     }
 }
 
+async fn fallback_handler(uri: http::Uri) -> impl IntoResponse {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "error": "Not Found",
+            "message": format!("The requested path '{}' does not exist on this server.", uri.path())
+        })),
+    )
+}
+
+async fn add_handler(Path((x, y)): Path<(i32, i32)>, request: Request) -> Json<serde_json::Value> {
+    let bff_user = request
+        .headers()
+        .get("X-BFF-IDToken-Sub")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("None");
+    let comment = request
+        .extensions()
+        .get::<TokenValidationInfo>()
+        .map(|info| info.0.clone())
+        .unwrap_or_else(|| "Unknown".to_string());
+
+    Json(serde_json::json!({ "result": x + y, "comment": comment, "user": bff_user }))
+}
+
+/// Normalizes the request URI by stripping any prefix before '/api/'.
+fn rewrite_api_path(mut req: Request) -> Request {
+    let path = req.uri().path();
+
+    if let Some(pos) = path.find("/api/") {
+        if pos != 0 {
+            let new_path = &path[pos..];
+
+            // Preserve query parameters (e.g., ?foo=bar)
+            let query = req
+                .uri()
+                .query()
+                .map(|q| format!("?{}", q))
+                .unwrap_or_default();
+            let new_pq = format!("{}{}", new_path, query);
+
+            let mut parts = req.uri().clone().into_parts();
+            parts.path_and_query = Some(new_pq.parse().unwrap());
+
+            *req.uri_mut() = Uri::from_parts(parts).unwrap();
+        }
+    }
+    req
+}
+
+async fn path_normalization_middleware(req: Request, next: axum::middleware::Next) -> Response {
+    let req = rewrite_api_path(req);
+    next.run(req).await
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Load environment variables from .env file if it exists.
     dotenvy::dotenv().ok();
 
-    // Setup tracing subscriber for logging.
     let rust_log = std::env::var("RUST_LOG").unwrap_or_else(|_| "info,tower_http=info".into());
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(&rust_log))
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    // --- Configuration ---
-    // These settings are configured via environment variables, typically set in a Docker Compose file.
-    let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let api_host = std::env::var("API_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+    let api_ports_str = std::env::var("API_PORTS").unwrap_or_else(|_| "7444".to_string());
+    let ports: Vec<String> = api_ports_str
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+
+    let db_url = std::env::var("DATABASE_URL").ok().or_else(|| {
+        let host = std::env::var("DB_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+        let port = std::env::var("DB_PORT").unwrap_or_else(|_| "5432".to_string());
+        let name = std::env::var("DB_NAME").unwrap_or_else(|_| "shopdb".to_string());
+        let user = std::env::var("DB_USER").unwrap_or_else(|_| "shopuser".to_string());
+        let password = std::env::var("DB_PASSWORD").unwrap_or_else(|_| "myShopPwABC".to_string());
+        Some(format!(
+            "postgresql://{user}:{password}@{host}:{port}/{name}"
+        ))
+    });
+
     let oidc_issuer_internal =
         std::env::var("OIDC_ISSUER_URL_INTERNAL").expect("OIDC_ISSUER_URL_INTERNAL must be set");
     let oidc_issuer_external =
         std::env::var("OIDC_ISSUER_URL_EXTERNAL").expect("OIDC_ISSUER_URL_EXTERNAL must be set");
     let allowed_origins_str =
         std::env::var("CORS_ALLOWED_ORIGINS").expect("CORS_ALLOWED_ORIGINS must be set");
-    let server_address = std::env::var("SERVER_ADDRESS").expect("SERVER_ADDRESS must be set");
-    let jwks_uri = format!("{}/jwks.json", oidc_issuer_internal);
+    let oidc_audience = std::env::var("OIDC_AUDIENCE").unwrap_or_else(|_| "fruit-shop".to_string());
+    let oidc_algo_str = std::env::var("OIDC_ALGORITHM").unwrap_or_else(|_| "RS256".to_string());
+    let algorithm = match oidc_algo_str.as_str() {
+        "EdDSA" => jsonwebtoken::Algorithm::EdDSA,
+        _ => jsonwebtoken::Algorithm::RS256,
+    };
 
-    info!("--- Application Configuration ---");
-    info!("RUST_LOG: {}", rust_log);
-    info!("DATABASE_URL: {}", db_url);
-    info!("OIDC_ISSUER_URL_INTERNAL: {}", oidc_issuer_internal);
-    info!("OIDC_ISSUER_URL_EXTERNAL: {}", oidc_issuer_external);
-    info!("CORS_ALLOWED_ORIGINS: '{}'", allowed_origins_str);
-    info!("SERVER_ADDRESS: {}", server_address);
-    info!("---------------------------------");
+    let discovery_client = reqwest::Client::new();
+    let discovery_resp: serde_json::Value = discovery_client
+        .get(format!(
+            "{}/.well-known/openid-configuration",
+            oidc_issuer_internal.trim_end_matches('/')
+        ))
+        .send()
+        .await?
+        .json()
+        .await?;
+    let jwks_uri = discovery_resp["jwks_uri"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
 
-    // --- Database Pool ---
-    let mut cfg = Config::new();
-    cfg.url = Some(db_url);
-    cfg.pool = Some(deadpool_postgres::PoolConfig {
-        max_size: 10,
-        timeouts: deadpool_postgres::Timeouts {
-            wait: Some(Duration::from_secs(5)), // Set the timeout for getting a connection from the pool.
+    let (db_pool, db_url_to_store) = if let Some(url) = db_url {
+        let mut cfg = Config::new();
+        cfg.url = Some(url.clone());
+        cfg.pool = Some(deadpool_postgres::PoolConfig {
+            max_size: 10,
+            timeouts: deadpool_postgres::Timeouts {
+                wait: Some(Duration::from_secs(5)),
+                ..Default::default()
+            },
             ..Default::default()
-        },
-        ..Default::default()
-    });
-    // For simplicity in this demo, we use NoTls. For production, configure TLS.
-    let db_pool = cfg.create_pool(Some(Runtime::Tokio1), NoTls)?;
-    info!("Database connection pool established.");
+        });
+        match cfg.create_pool(Some(Runtime::Tokio1), NoTls) {
+            Ok(pool) => (Some(pool), Some(url)),
+            Err(e) => {
+                error!(
+                    "Database connection failed at startup: {}. The server will start in DB-less mode and retry connection on demand.",
+                    e
+                );
+                (None, Some(url))
+            }
+        }
+    } else {
+        info!("Database is not configured. DB features will be disabled.");
+        (None, None)
+    };
 
-    // --- JWT Validation Setup ---
     let external_issuers: Vec<String> = oidc_issuer_external
         .split(',')
         .map(|s| s.trim().to_string())
         .collect();
-
-    let mut validation = Validation::new(jsonwebtoken::Algorithm::EdDSA);
+    let mut validation = Validation::new(algorithm);
     validation.set_issuer(&external_issuers);
-    validation.set_audience(&["fruit-shop"]);
-    info!(
-        "JWT validation configured: issuers={:?}, audience='{}'",
-        external_issuers, "fruit-shop"
-    );
+    validation.set_audience(&[&oidc_audience]);
 
-    // --- App State ---
     let app_state = AppState {
-        db_pool,
+        db_url: db_url_to_store,
+        db_pool: Arc::new(RwLock::new(db_pool)),
         jwks_client: Arc::new(JwksClient::new(&jwks_uri)),
         jwt_validation: Arc::new(validation),
     };
 
-    // --- CORS Layer ---
     let allowed_origins = allowed_origins_str
         .split(',')
         .map(|origin| origin.trim().parse().expect("Failed to parse origin"))
@@ -536,40 +573,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .allow_methods(Any)
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
 
-    // --- Router ---
-    let api_routes = Router::new()
-        .route("/fruits", get(get_fruits_handler)) // For the list
-        .route("/fruits/{id}", get(get_fruit_by_id_handler)) // For a single item
+    let api_router = Router::new()
+        .route("/", get(root_handler))
+        .route("/api/add/{x}/{y}", get(add_handler))
+        .route("/api/fruits", get(get_fruits_handler))
+        .route("/api/fruits/{id}", get(get_fruit_by_id_handler))
         .route_layer(middleware::from_fn_with_state(
             app_state.clone(),
             auth_middleware,
-        ));
+        ))
+        .fallback(fallback_handler)
+        .with_state(app_state);
 
+    // Apply path normalization and CORS to the entire application
     let app = Router::new()
-        .route("/", get(root_handler))
-        .nest("/api", api_routes)
-        .with_state(app_state)
+        .fallback_service(api_router)
+        .layer(middleware::from_fn(path_normalization_middleware))
         .layer(cors_layer)
         .layer(tower_http::trace::TraceLayer::new_for_http());
 
-    // --- Start Server ---
-    let listener = tokio::net::TcpListener::bind(&server_address).await?;
-    info!("Backend server listening on {}", server_address);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    let mut handles = Vec::new();
+    for port in ports {
+        let server_address = format!("{}:{}", api_host, port);
+        let listener = tokio::net::TcpListener::bind(&server_address).await?;
+        let app_clone = app.clone();
+
+        info!("Backend server listening on {}", server_address);
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app_clone)
+                .with_graceful_shutdown(shutdown_signal())
+                .await
+        });
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        let _ = handle.await?;
+    }
 
     Ok(())
 }
 
-/// Listens for the OS shutdown signal (e.g., Ctrl+C or SIGTERM).
 async fn shutdown_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await
             .expect("failed to install Ctrl+C handler");
     };
-
     #[cfg(unix)]
     let terminate = async {
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -577,14 +627,9 @@ async fn shutdown_signal() {
             .recv()
             .await;
     };
-
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
 
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
-    }
-
+    tokio::select! { _ = ctrl_c => {}, _ = terminate => {}, }
     info!("Signal received, starting graceful shutdown");
 }

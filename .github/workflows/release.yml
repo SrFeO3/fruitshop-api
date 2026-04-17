@@ -1,0 +1,49 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Build binaries
+        run: cargo build --target x86_64-unknown-linux-musl --release
+
+      - name: Strip binary
+        run: strip target/x86_64-unknown-linux-musl/release/fruitshop-api
+
+      - name: Prepare assets
+        run: |
+          mkdir -p release-assets
+          cp target/x86_64-unknown-linux-musl/release/fruitshop-api release-assets/fruitshop-api
+
+      - name: Create or Update Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest Release
+          body: "Automatically built from the latest commit on main branch."
+          files: |
+            release-assets/fruitshop-api
+
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

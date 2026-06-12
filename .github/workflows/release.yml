@@ -22,13 +22,27 @@ jobs:
         with:
           targets: x86_64-unknown-linux-musl
 
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools cmake perl build-essential nasm pkg-config clang llvm
 
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        run: cargo install cargo-zigbuild
+
       - name: Build binaries
-        run: cargo build --target x86_64-unknown-linux-musl --release
+        run: |
+          CC="zig cc" \
+          CXX="zig c++" \
+          cargo zigbuild --target x86_64-unknown-linux-musl --release
 
       - name: Strip binary
         run: strip target/x86_64-unknown-linux-musl/release/fruitshop-api

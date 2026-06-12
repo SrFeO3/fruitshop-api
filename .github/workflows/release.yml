@@ -25,7 +25,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools
+          sudo apt-get install -y musl-tools cmake perl build-essential nasm pkg-config clang llvm
 
       - name: Build binaries
         run: cargo build --target x86_64-unknown-linux-musl --release

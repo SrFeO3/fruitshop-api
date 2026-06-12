@@ -19,6 +19,7 @@
 //!   - OIDC_ISSUER_URL_INTERNAL: Discovery URL for JWKS.
 //!   - OIDC_ISSUER_URL_EXTERNAL: Allowed 'iss' claims in tokens.
 //!   - CORS_ALLOWED_ORIGINS: Permitted origins for CORS.
+//!   - TRUST_CERTIFICATE_ROOT: Path to custom CA bundle (e.g., /etc/ssl/certs/cacert.pem or https://curl.se/ca/cacert.pem)
 //!
 //! [Token Processing]
 //!   - Requires Bearer token in Authorization header.
@@ -46,7 +47,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{sync::RwLock, time::Duration};
 use tokio_postgres::NoTls;
 use tower_http::cors::{Any, CorsLayer};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Debug, thiserror::Error)]
@@ -162,11 +163,11 @@ fn decode_claims_unverified(token: &str) -> Option<Claims> {
 }
 
 impl JwksClient {
-    fn new(jwks_uri: &str) -> Self {
+    fn new(jwks_uri: &str, http_client: reqwest::Client) -> Self {
         Self {
             jwks_uri: jwks_uri.to_string(),
             keys: RwLock::new(HashMap::new()),
-            http_client: reqwest::Client::new(),
+            http_client,
         }
     }
 
@@ -465,6 +466,31 @@ async fn path_normalization_middleware(req: Request, next: axum::middleware::Nex
     next.run(req).await
 }
 
+/// Creates a shared HTTP Client.
+/// If `TRUST_CERTIFICATE_ROOT` is specified, it reads the CA bundle and configures trust anchors.
+fn create_http_client() -> Result<reqwest::Client, Box<dyn std::error::Error>> {
+    let mut builder = reqwest::Client::builder();
+
+    if let Ok(cert_path) = std::env::var("TRUST_CERTIFICATE_ROOT") {
+        info!("Loading custom CA certificates from TRUST_CERTIFICATE_ROOT: {}", cert_path);
+        let cert_data = std::fs::read(&cert_path)
+            .map_err(|e| format!("Failed to read certificate file at '{}': {}", cert_path, e))?;
+
+        let certs = reqwest::Certificate::from_pem_bundle(&cert_data)
+            .map_err(|e| format!("Failed to parse PEM bundle from '{}': {}", cert_path, e))?;
+
+        let count = certs.len();
+        for cert in certs {
+            builder = builder.add_root_certificate(cert);
+        }
+        info!("Successfully registered {} root certificates.", count);
+    } else {
+        warn!("TRUST_CERTIFICATE_ROOT environment variable not set. Falling back to default system roots.");
+    }
+
+    Ok(builder.build()?)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
@@ -474,6 +500,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(tracing_subscriber::EnvFilter::new(&rust_log))
         .with(tracing_subscriber::fmt::layer())
         .init();
+
+    // 1. Build the shared HTTP client (includes loading of TRUST_CERTIFICATE_ROOT)
+    let http_client = create_http_client()?;
 
     let api_host = std::env::var("API_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
     let api_ports_str = std::env::var("API_PORTS").unwrap_or_else(|_| "7444".to_string());
@@ -507,8 +536,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => jsonwebtoken::Algorithm::RS256,
     };
 
-    let discovery_client = reqwest::Client::new();
-    let discovery_resp: serde_json::Value = discovery_client
+    // Use the shared http_client for OIDC discovery
+    let discovery_resp: serde_json::Value = http_client
         .get(format!(
             "{}/.well-known/openid-configuration",
             oidc_issuer_internal.trim_end_matches('/')
@@ -556,10 +585,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     validation.set_issuer(&external_issuers);
     validation.set_audience(&[&oidc_audience]);
 
+    // Use a cheap clone of http_client to share connections and certificates
+    let jwks_client = Arc::new(JwksClient::new(&jwks_uri, http_client.clone()));
+
     let app_state = AppState {
         db_url: db_url_to_store,
         db_pool: Arc::new(RwLock::new(db_pool)),
-        jwks_client: Arc::new(JwksClient::new(&jwks_uri)),
+        jwks_client,
         jwt_validation: Arc::new(validation),
     };
 
